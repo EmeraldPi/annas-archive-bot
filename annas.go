@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"html"
+	"math/big"
 	"net/url"
 	"strconv"
 	"time"
@@ -15,13 +17,12 @@ import (
 )
 
 type BookStorageItem struct {
-	message tele.StoredMessage
-	items   []*BookItem
-	page    int
-	sender  int64
-	expires time.Time
-	codes   []string
-	codeMap map[string]int
+	message   tele.StoredMessage
+	items     []*BookItem
+	page      int
+	sender    int64
+	expires   time.Time
+	sessionID string
 }
 
 type BookItem struct {
@@ -33,17 +34,28 @@ type BookItem struct {
 	Image     string
 }
 
+type SearchSession struct {
+	ID       string
+	ChatID   int64
+	SenderID int64
+	Items    []*BookItem
+	Codes    []string
+	CodeMap  map[string]int
+	Expires  time.Time
+}
+
 var (
 	selector        = &tele.ReplyMarkup{}
 	bookBtnBack     = selector.Data("Back", "back")
 	bookBtnDownload = selector.Data("Download", "dl", "0")
 	bookStorage     = make(map[int64]map[int]*BookStorageItem)
-	userSessions    = make(map[int64]map[int64]*BookStorageItem)
+	searchSessions  = make(map[string]*SearchSession)
 )
 
 const (
-	resultListLimit = 10
-	shortCodeLength = 3
+	resultListLimit  = 10
+	shortCodeLength  = 3
+	searchSessionTTL = 15 * time.Minute
 )
 
 func getReply(item *BookItem) string {
@@ -66,42 +78,86 @@ func getReply(item *BookItem) string {
 	return reply
 }
 
-func setUserSession(chatID int64, senderID int64, item *BookStorageItem) {
-	if _, ok := userSessions[chatID]; !ok {
-		userSessions[chatID] = make(map[int64]*BookStorageItem)
-	}
-	userSessions[chatID][senderID] = item
-}
-
-func getUserSession(chatID int64, senderID int64) (*BookStorageItem, bool) {
-	if chatSessions, ok := userSessions[chatID]; ok {
-		item, exists := chatSessions[senderID]
-		return item, exists
-	}
-	return nil, false
-}
-
-func saveBookStorageItem(msg *tele.Message, items []*BookItem, page int, sender int64, codes []string, codeMap map[string]int) *BookStorageItem {
+func saveBookStorageItem(msg *tele.Message, items []*BookItem, sessionID string, page int, sender int64) *BookStorageItem {
 	if msg == nil {
 		return nil
 	}
 	item := &BookStorageItem{
-		message: tele.StoredMessage{ChatID: msg.Chat.ID, MessageID: strconv.Itoa(msg.ID)},
-		items:   items,
-		page:    page,
-		sender:  sender,
-		codes:   codes,
-		codeMap: codeMap,
-		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
+		message:   tele.StoredMessage{ChatID: msg.Chat.ID, MessageID: strconv.Itoa(msg.ID)},
+		items:     items,
+		page:      page,
+		sender:    sender,
+		sessionID: sessionID,
+		expires:   time.Now().Local().Add(time.Hour * time.Duration(1)),
 	}
 
 	if _, ok := bookStorage[msg.Chat.ID]; !ok {
 		bookStorage[msg.Chat.ID] = make(map[int]*BookStorageItem)
 	}
 	bookStorage[msg.Chat.ID][msg.ID] = item
-	setUserSession(msg.Chat.ID, sender, item)
 
 	return item
+}
+
+func generateSearchID() string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 4)
+	max := big.NewInt(int64(len(alphabet)))
+	for i := range b {
+		n, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			b[i] = alphabet[time.Now().UnixNano()%int64(len(alphabet))]
+			continue
+		}
+		b[i] = alphabet[n.Int64()]
+	}
+	return string(b)
+}
+
+func cleanupExpiredSessions() {
+	now := time.Now()
+	for id, session := range searchSessions {
+		if session.Expires.Before(now) {
+			delete(searchSessions, id)
+		}
+	}
+}
+
+func createSearchSession(chatID, senderID int64, items []*BookItem, codes []string, codeMap map[string]int) *SearchSession {
+	cleanupExpiredSessions()
+
+	id := generateSearchID()
+	for {
+		if _, exists := searchSessions[id]; !exists {
+			break
+		}
+		id = generateSearchID()
+	}
+
+	session := &SearchSession{
+		ID:       id,
+		ChatID:   chatID,
+		SenderID: senderID,
+		Items:    items,
+		Codes:    codes,
+		CodeMap:  codeMap,
+		Expires:  time.Now().Add(searchSessionTTL),
+	}
+	searchSessions[id] = session
+
+	return session
+}
+
+func getSearchSession(id string) (*SearchSession, bool) {
+	session, ok := searchSessions[id]
+	if !ok {
+		return nil, false
+	}
+	if session.Expires.Before(time.Now()) {
+		delete(searchSessions, id)
+		return nil, false
+	}
+	return session, true
 }
 
 func generateShortCode(bookURL string, index int, used map[string]bool) string {
@@ -131,7 +187,7 @@ func generateShortCode(bookURL string, index int, used map[string]bool) string {
 	return code
 }
 
-func formatResultList(items []*BookItem, codes []string, limit int) string {
+func formatResultList(items []*BookItem, codes []string, limit int, sessionID string) string {
 	if len(items) == 0 || limit <= 0 {
 		return ""
 	}
@@ -155,15 +211,15 @@ func formatResultList(items []*BookItem, codes []string, limit int) string {
 		if code == "" {
 			code = fmt.Sprintf("book%d", i+1)
 		}
-		builder.WriteString(fmt.Sprintf("%d. %s\n/%s\n\n", i+1, html.EscapeString(title), code))
+		builder.WriteString(fmt.Sprintf("%d. %s\n/%s_%s\n\n", i+1, html.EscapeString(title), code, sessionID))
 	}
 
 	return builder.String()
 }
 
-func buildResultList(items []*BookItem, limit int) (string, []string, map[string]int) {
+func buildResultCodes(items []*BookItem, limit int) ([]string, map[string]int) {
 	if len(items) == 0 || limit <= 0 {
-		return "", nil, nil
+		return nil, nil
 	}
 	if len(items) < limit {
 		limit = len(items)
@@ -180,9 +236,7 @@ func buildResultList(items []*BookItem, limit int) (string, []string, map[string
 		codeMap[strings.ToLower(code)] = i
 	}
 
-	reply := formatResultList(items, codes, limit)
-
-	return reply, codes, codeMap
+	return codes, codeMap
 }
 
 func BookPaginator(c tele.Context) error {
@@ -194,23 +248,23 @@ func BookPaginator(c tele.Context) error {
 		return nil
 	}
 
-	reply, codes, codeMap := buildResultList(items, resultListLimit)
-	if reply == "" {
+	codes, codeMap := buildResultCodes(items, resultListLimit)
+	if len(codes) == 0 {
 		return nil
 	}
 
-	m, err := c.Bot().Send(c.Recipient(), reply, tele.ModeHTML)
+	session := createSearchSession(c.Chat().ID, c.Message().Sender.ID, items, codes, codeMap)
+	reply := formatResultList(items, codes, resultListLimit, session.ID)
+
+	_, err = c.Bot().Send(c.Recipient(), reply, tele.ModeHTML)
 	if err != nil {
 		return err
 	}
 
-	saveBookStorageItem(m, items, 0, c.Message().Sender.ID, codes, codeMap)
-
 	return c.Respond()
 }
 
-func renderBookDetail(c tele.Context, storageItem *BookStorageItem, index int, sender int64, editExisting bool) error {
-	items := storageItem.items
+func renderBookDetail(c tele.Context, items []*BookItem, sessionID string, storageItem *BookStorageItem, index int, sender int64, editExisting bool) error {
 	if len(items) == 0 || index < 0 || index >= len(items) {
 		return c.Respond()
 	}
@@ -237,6 +291,9 @@ func renderBookDetail(c tele.Context, storageItem *BookStorageItem, index int, s
 	)
 
 	if editExisting {
+		if storageItem == nil {
+			return c.Respond()
+		}
 		m, err = c.Bot().Edit(storageItem.message, reply, selector, tele.ModeHTML)
 	} else {
 		m, err = c.Bot().Send(c.Chat(), reply, selector, tele.ModeHTML)
@@ -244,7 +301,7 @@ func renderBookDetail(c tele.Context, storageItem *BookStorageItem, index int, s
 	if err != nil {
 		return c.Respond()
 	}
-	saveBookStorageItem(m, items, index+1, sender, storageItem.codes, storageItem.codeMap)
+	saveBookStorageItem(m, items, sessionID, index+1, sender)
 
 	return c.Respond()
 }
@@ -273,7 +330,7 @@ func BackPage(c tele.Context) error {
 		return c.Respond()
 	}
 
-	return renderBookDetail(c, bookItem, index, c.Callback().Sender.ID, true)
+	return renderBookDetail(c, bookItem.items, bookItem.sessionID, bookItem, index, c.Callback().Sender.ID, true)
 }
 
 func HandleShortCodeCommand(c tele.Context) error {
@@ -309,20 +366,28 @@ func HandleShortCodeCommand(c tele.Context) error {
 		return nil
 	}
 
-	session, ok := getUserSession(chat.ID, sender.ID)
-	if !ok || session == nil {
+	parts := strings.Split(command, "_")
+	if len(parts) != 2 {
 		return nil
 	}
-	if session.expires.Before(time.Now()) {
+	code := strings.ToLower(parts[0])
+	sessionID := parts[1]
+
+	session, ok := getSearchSession(sessionID)
+	if !ok || session == nil {
+		c.Send("Those results expired—please run /books again.")
+		return nil
+	}
+	if session.ChatID != chat.ID || session.SenderID != sender.ID {
 		return nil
 	}
 
-	index, found := session.codeMap[strings.ToLower(command)]
+	index, found := session.CodeMap[code]
 	if !found {
 		return nil
 	}
 
-	return renderBookDetail(c, session, index, sender.ID, false)
+	return renderBookDetail(c, session.Items, session.ID, nil, index, sender.ID, false)
 }
 
 func DownloadItem(c tele.Context) error {
@@ -412,7 +477,7 @@ func DownloadItem(c tele.Context) error {
 		fmt.Println(err)
 		return c.Respond()
 	}
-	saveBookStorageItem(m, items, page, bookItem.sender, bookItem.codes, bookItem.codeMap)
+	saveBookStorageItem(m, items, bookItem.sessionID, page, bookItem.sender)
 
 	return c.Respond()
 }
