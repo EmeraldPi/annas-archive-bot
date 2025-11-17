@@ -264,6 +264,13 @@ func BookPaginator(c tele.Context) error {
 	return c.Respond()
 }
 
+func HelpCommand(c tele.Context) error {
+	helpText := "Send /search followed by your keywords (e.g. /search harry potter).\n" +
+		"I’ll return the top results with short /codes. Tap a code to get details and download links.\n" +
+		"Codes stay valid for about 15 minutes per search. Run /search again for fresh results."
+	_, err := c.Bot().Send(c.Recipient(), helpText)
+	return err
+}
 func renderBookDetail(c tele.Context, items []*BookItem, sessionID string, storageItem *BookStorageItem, index int, sender int64, editExisting bool) error {
 	if len(items) == 0 || index < 0 || index >= len(items) {
 		return c.Respond()
@@ -347,7 +354,7 @@ func HandleShortCodeCommand(c tele.Context) error {
 	if firstWord == "" {
 		return nil
 	}
-	if strings.HasPrefix(firstWord, "/books") {
+	if strings.HasPrefix(firstWord, "/search") || strings.HasPrefix(firstWord, "/help") {
 		return nil
 	}
 
@@ -443,8 +450,9 @@ func DownloadItem(c tele.Context) error {
 
 	rows := make([]tele.Row, 0)
 	rows = append(rows, selector.Row(bookBtnBack))
+	mirrorCount := 1
 	fmt.Println("URLS list: ", urls)
-	for i, u := range urls {
+	for _, u := range urls {
 		// skip URLs that require authentication
 		if strings.HasPrefix(u, "/fast_download") {
 			continue
@@ -453,11 +461,12 @@ func DownloadItem(c tele.Context) error {
 		if strings.HasPrefix(u, "/slow_download") {
 			u = "https://annas-archive.org" + u
 		}
-		if len(rows) > 4 {
+		if mirrorCount > 4 {
 			break
 		}
 
-		rows = append(rows, selector.Row(selector.URL(fmt.Sprintf("Mirror #%d", i), u)))
+		rows = append(rows, selector.Row(selector.URL(fmt.Sprintf("Mirror #%d", mirrorCount), u)))
+		mirrorCount++
 	}
 
 	selector.Inline(
@@ -497,7 +506,7 @@ func FindBook(query string) ([]*BookItem, error) {
 		fmt.Println("Visiting", r.URL.String())
 	})
 
-	fullURL := "https://annas-archive.org/search?q=" + url.QueryEscape(query)
+	fullURL := "https://annas-archive.org/search?ext=epub&q=" + url.QueryEscape(query)
 	err := c.Visit(fullURL)
 	if err != nil {
 		return nil, err

@@ -33,7 +33,8 @@ func main() {
 	}
 	b.Use(middleware.Logger())
 
-	b.Handle("/books", BookPaginator)
+	b.Handle("/search", BookPaginator)
+	b.Handle("/help", HelpCommand)
 	b.Handle(tele.OnText, HandleShortCodeCommand)
 	b.Handle(&bookBtnBack, BackPage)
 	b.Handle(&bookBtnDownload, DownloadItem)
