@@ -265,7 +265,7 @@ func BookPaginator(c tele.Context) error {
 		return err
 	}
 
-	return c.Respond()
+	return nil
 }
 
 func sendHelpText(c tele.Context) error {
