@@ -34,9 +34,7 @@ func main() {
 	b.Use(middleware.Logger())
 
 	b.Handle("/books", BookPaginator)
-
-	b.Handle(&bookBtnSelect, ShowBookDetail)
-	b.Handle(&bookBtnReset, ResetPage)
+	b.Handle(tele.OnText, HandleShortCodeCommand)
 	b.Handle(&bookBtnBack, BackPage)
 	b.Handle(&bookBtnDownload, DownloadItem)
 

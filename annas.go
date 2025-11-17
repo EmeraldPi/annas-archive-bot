@@ -20,6 +20,8 @@ type BookStorageItem struct {
 	page    int
 	sender  int64
 	expires time.Time
+	codes   []string
+	codeMap map[string]int
 }
 
 type BookItem struct {
@@ -33,11 +35,10 @@ type BookItem struct {
 
 var (
 	selector        = &tele.ReplyMarkup{}
-	bookBtnReset    = selector.Data("🔄", "reset")
-	bookBtnSelect   = selector.Data("Select", "select")
 	bookBtnBack     = selector.Data("Back", "back")
 	bookBtnDownload = selector.Data("Download", "dl", "0")
-	bookStorage     = make(map[int64]map[int]interface{})
+	bookStorage     = make(map[int64]map[int]*BookStorageItem)
+	userSessions    = make(map[int64]map[int64]*BookStorageItem)
 )
 
 const (
@@ -63,6 +64,44 @@ func getReply(item *BookItem) string {
 		reply = reply + fmt.Sprintf("• %s\n", html.EscapeString(item.Meta))
 	}
 	return reply
+}
+
+func setUserSession(chatID int64, senderID int64, item *BookStorageItem) {
+	if _, ok := userSessions[chatID]; !ok {
+		userSessions[chatID] = make(map[int64]*BookStorageItem)
+	}
+	userSessions[chatID][senderID] = item
+}
+
+func getUserSession(chatID int64, senderID int64) (*BookStorageItem, bool) {
+	if chatSessions, ok := userSessions[chatID]; ok {
+		item, exists := chatSessions[senderID]
+		return item, exists
+	}
+	return nil, false
+}
+
+func saveBookStorageItem(msg *tele.Message, items []*BookItem, page int, sender int64, codes []string, codeMap map[string]int) *BookStorageItem {
+	if msg == nil {
+		return nil
+	}
+	item := &BookStorageItem{
+		message: tele.StoredMessage{ChatID: msg.Chat.ID, MessageID: strconv.Itoa(msg.ID)},
+		items:   items,
+		page:    page,
+		sender:  sender,
+		codes:   codes,
+		codeMap: codeMap,
+		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
+	}
+
+	if _, ok := bookStorage[msg.Chat.ID]; !ok {
+		bookStorage[msg.Chat.ID] = make(map[int]*BookStorageItem)
+	}
+	bookStorage[msg.Chat.ID][msg.ID] = item
+	setUserSession(msg.Chat.ID, sender, item)
+
+	return item
 }
 
 func generateShortCode(bookURL string, index int, used map[string]bool) string {
@@ -92,9 +131,9 @@ func generateShortCode(bookURL string, index int, used map[string]bool) string {
 	return code
 }
 
-func buildResultList(items []*BookItem, limit int) (string, []tele.Row) {
+func formatResultList(items []*BookItem, codes []string, limit int) string {
 	if len(items) == 0 || limit <= 0 {
-		return "", nil
+		return ""
 	}
 	if len(items) < limit {
 		limit = len(items)
@@ -103,32 +142,47 @@ func buildResultList(items []*BookItem, limit int) (string, []tele.Row) {
 	var builder strings.Builder
 	builder.WriteString("Here are the top results:\n\n")
 
-	rows := make([]tele.Row, 0)
-	currentRow := make([]tele.Btn, 0, 2)
-	usedCodes := make(map[string]bool)
-
 	for i := 0; i < limit; i++ {
 		item := items[i]
 		title := item.Title
 		if title == "" {
 			title = "Untitled"
 		}
-		code := generateShortCode(item.URL, i, usedCodes)
-		builder.WriteString(fmt.Sprintf("%d. %s\n<code>/%s</code>\n\n", i+1, html.EscapeString(title), html.EscapeString(code)))
-
-		btn := selector.Data(fmt.Sprintf("/%s", code), bookBtnSelect.Unique, strconv.Itoa(i))
-		currentRow = append(currentRow, btn)
-		if len(currentRow) == 2 {
-			rows = append(rows, selector.Row(currentRow[0], currentRow[1]))
-			currentRow = currentRow[:0]
+		code := ""
+		if i < len(codes) {
+			code = codes[i]
 		}
+		if code == "" {
+			code = fmt.Sprintf("book%d", i+1)
+		}
+		builder.WriteString(fmt.Sprintf("%d. %s\n/%s\n\n", i+1, html.EscapeString(title), code))
 	}
 
-	if len(currentRow) > 0 {
-		rows = append(rows, selector.Row(currentRow...))
+	return builder.String()
+}
+
+func buildResultList(items []*BookItem, limit int) (string, []string, map[string]int) {
+	if len(items) == 0 || limit <= 0 {
+		return "", nil, nil
+	}
+	if len(items) < limit {
+		limit = len(items)
 	}
 
-	return builder.String(), rows
+	codes := make([]string, len(items))
+	codeMap := make(map[string]int)
+	usedCodes := make(map[string]bool)
+
+	for i := 0; i < limit; i++ {
+		item := items[i]
+		code := generateShortCode(item.URL, i, usedCodes)
+		codes[i] = code
+		codeMap[strings.ToLower(code)] = i
+	}
+
+	reply := formatResultList(items, codes, limit)
+
+	return reply, codes, codeMap
 }
 
 func BookPaginator(c tele.Context) error {
@@ -140,125 +194,57 @@ func BookPaginator(c tele.Context) error {
 		return nil
 	}
 
-	reply, rows := buildResultList(items, resultListLimit)
+	reply, codes, codeMap := buildResultList(items, resultListLimit)
 	if reply == "" {
 		return nil
 	}
 
-	selector.Inline(rows...)
-	m, _ := c.Bot().Send(c.Recipient(), reply, selector, tele.ModeHTML)
-
-	_, ok := bookStorage[m.Chat.ID]
-	if !ok {
-		bookStorage[m.Chat.ID] = make(map[int]interface{})
+	m, err := c.Bot().Send(c.Recipient(), reply, tele.ModeHTML)
+	if err != nil {
+		return err
 	}
 
-	bookStorage[m.Chat.ID][m.ID] = &BookStorageItem{
-		message: tele.StoredMessage{ChatID: m.Chat.ID, MessageID: strconv.Itoa(m.ID)},
-		items:   items,
-		page:    0,
-		sender:  c.Message().Sender.ID,
-		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
-	}
+	saveBookStorageItem(m, items, 0, c.Message().Sender.ID, codes, codeMap)
 
 	return c.Respond()
 }
 
-func ResetPage(c tele.Context) error {
-	mc := c.Callback().Message
-
-	_, ok := bookStorage[mc.Chat.ID]
-	if !ok {
-		return c.Respond()
-	}
-	bi, ok := bookStorage[mc.Chat.ID][mc.ID]
-	if !ok {
-		return c.Respond()
-	}
-	bookItem := bi.(*BookStorageItem)
-	if bookItem.sender != c.Callback().Sender.ID {
-		fmt.Println("ID don't match: ", bookItem.sender, c.Callback().Sender.ID)
-		return c.Respond(&tele.CallbackResponse{
-			Text: "This is not for you, you silly goober",
-		})
-	}
-
-	items := bookItem.items
-	reply, rows := buildResultList(items, resultListLimit)
-	if reply == "" {
-		return c.Respond()
-	}
-
-	selector.Inline(rows...)
-	m, err := c.Bot().Edit(bookItem.message, reply, selector, tele.ModeHTML)
-	if err != nil {
-		return c.Respond()
-	}
-	bookStorage[m.Chat.ID][m.ID] = &BookStorageItem{
-		message: tele.StoredMessage{ChatID: m.Chat.ID, MessageID: strconv.Itoa(m.ID)},
-		items:   items,
-		page:    0,
-		sender:  c.Callback().Sender.ID,
-		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
-	}
-
-	return c.Respond()
-}
-
-func ShowBookDetail(c tele.Context) error {
-	mc := c.Callback().Message
-
-	_, ok := bookStorage[mc.Chat.ID]
-	if !ok {
-		return c.Respond()
-	}
-	bi, ok := bookStorage[mc.Chat.ID][mc.ID]
-	if !ok {
-		return c.Respond()
-	}
-	bookItem := bi.(*BookStorageItem)
-	if bookItem.sender != c.Callback().Sender.ID {
-		fmt.Println("ID don't match: ", bookItem.sender, c.Callback().Sender.ID)
-		return c.Respond(&tele.CallbackResponse{
-			Text: "This is not for you, you silly goober",
-		})
-	}
-
-	idx, err := strconv.Atoi(c.Callback().Data)
-	if err != nil {
-		return c.Respond()
-	}
-
-	return renderBookDetail(c, bookItem, idx, c.Callback().Sender.ID)
-}
-
-func renderBookDetail(c tele.Context, storageItem *BookStorageItem, index int, sender int64) error {
+func renderBookDetail(c tele.Context, storageItem *BookStorageItem, index int, sender int64, editExisting bool) error {
 	items := storageItem.items
 	if len(items) == 0 || index < 0 || index >= len(items) {
 		return c.Respond()
 	}
 
-	bookBtnReset = selector.Data("⬅ Back to results", "reset")
-	bookBtnDownload = selector.Data("Download links", "dl", strconv.Itoa(index+1))
-	selector.Inline(
-		selector.Row(bookBtnReset),
-		selector.Row(bookBtnDownload),
-	)
-
 	item := items[index]
 	reply := getReply(item)
 
-	m, err := c.Bot().Edit(storageItem.message, reply, selector, tele.ModeHTML)
+	fullURL := item.URL
+	if !strings.HasPrefix(fullURL, "http") {
+		fullURL = strings.TrimPrefix(fullURL, "/")
+		fullURL = "https://annas-archive.org/" + fullURL
+	}
+
+	openBtn := selector.URL("Open on Anna's Archive", fullURL)
+	bookBtnDownload = selector.Data("Download links", "dl", strconv.Itoa(index+1))
+	selector.Inline(
+		selector.Row(openBtn),
+		selector.Row(bookBtnDownload),
+	)
+
+	var (
+		m   *tele.Message
+		err error
+	)
+
+	if editExisting {
+		m, err = c.Bot().Edit(storageItem.message, reply, selector, tele.ModeHTML)
+	} else {
+		m, err = c.Bot().Send(c.Chat(), reply, selector, tele.ModeHTML)
+	}
 	if err != nil {
 		return c.Respond()
 	}
-	bookStorage[m.Chat.ID][m.ID] = &BookStorageItem{
-		message: tele.StoredMessage{ChatID: m.Chat.ID, MessageID: strconv.Itoa(m.ID)},
-		items:   items,
-		page:    index + 1,
-		sender:  sender,
-		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
-	}
+	saveBookStorageItem(m, items, index+1, sender, storageItem.codes, storageItem.codeMap)
 
 	return c.Respond()
 }
@@ -266,15 +252,15 @@ func renderBookDetail(c tele.Context, storageItem *BookStorageItem, index int, s
 func BackPage(c tele.Context) error {
 	mc := c.Callback().Message
 
-	_, ok := bookStorage[mc.Chat.ID]
+	chatStorage, ok := bookStorage[mc.Chat.ID]
 	if !ok {
 		return c.Respond()
 	}
-	bi, ok := bookStorage[mc.Chat.ID][mc.ID]
+	bi, ok := chatStorage[mc.ID]
 	if !ok {
 		return c.Respond()
 	}
-	bookItem := bi.(*BookStorageItem)
+	bookItem := bi
 	if bookItem.sender != c.Callback().Sender.ID {
 		fmt.Println("ID don't match: ", bookItem.sender, c.Callback().Sender.ID)
 		return c.Respond(&tele.CallbackResponse{
@@ -287,7 +273,56 @@ func BackPage(c tele.Context) error {
 		return c.Respond()
 	}
 
-	return renderBookDetail(c, bookItem, index, c.Callback().Sender.ID)
+	return renderBookDetail(c, bookItem, index, c.Callback().Sender.ID, true)
+}
+
+func HandleShortCodeCommand(c tele.Context) error {
+	if c.Message() == nil {
+		return nil
+	}
+
+	text := strings.TrimSpace(c.Text())
+	if text == "" || !strings.HasPrefix(text, "/") {
+		return nil
+	}
+
+	firstWord := strings.Fields(text)[0]
+	if firstWord == "" {
+		return nil
+	}
+	if strings.HasPrefix(firstWord, "/books") {
+		return nil
+	}
+
+	command := strings.TrimPrefix(firstWord, "/")
+	if atIdx := strings.Index(command, "@"); atIdx > -1 {
+		command = command[:atIdx]
+	}
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return nil
+	}
+
+	chat := c.Chat()
+	sender := c.Sender()
+	if chat == nil || sender == nil {
+		return nil
+	}
+
+	session, ok := getUserSession(chat.ID, sender.ID)
+	if !ok || session == nil {
+		return nil
+	}
+	if session.expires.Before(time.Now()) {
+		return nil
+	}
+
+	index, found := session.codeMap[strings.ToLower(command)]
+	if !found {
+		return nil
+	}
+
+	return renderBookDetail(c, session, index, sender.ID, false)
 }
 
 func DownloadItem(c tele.Context) error {
@@ -301,15 +336,14 @@ func DownloadItem(c tele.Context) error {
 		c.Respond()
 	}
 
-	_, ok := bookStorage[mc.Chat.ID]
+	chatStorage, ok := bookStorage[mc.Chat.ID]
 	if !ok {
 		return c.Respond()
 	}
-	bi, ok := bookStorage[mc.Chat.ID][mc.ID]
+	bookItem, ok := chatStorage[mc.ID]
 	if !ok {
 		return c.Respond()
 	}
-	bookItem := bi.(*BookStorageItem)
 	if bookItem.sender != c.Callback().Sender.ID {
 		fmt.Println("ID don't match: ", bookItem.sender, c.Callback().Sender.ID)
 		return c.Respond(&tele.CallbackResponse{
@@ -378,13 +412,7 @@ func DownloadItem(c tele.Context) error {
 		fmt.Println(err)
 		return c.Respond()
 	}
-	bookStorage[m.Chat.ID][m.ID] = &BookStorageItem{
-		message: tele.StoredMessage{ChatID: m.Chat.ID, MessageID: strconv.Itoa(m.ID)},
-		items:   items,
-		page:    page,
-		sender:  c.Callback().Sender.ID,
-		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
-	}
+	saveBookStorageItem(m, items, page, bookItem.sender, bookItem.codes, bookItem.codeMap)
 
 	return c.Respond()
 }
