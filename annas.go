@@ -211,7 +211,7 @@ func formatResultList(items []*BookItem, codes []string, limit int, sessionID st
 		if code == "" {
 			code = fmt.Sprintf("book%d", i+1)
 		}
-		builder.WriteString(fmt.Sprintf("%d. %s\n/%s_%s\n\n", i+1, html.EscapeString(title), code, sessionID))
+		builder.WriteString(fmt.Sprintf("%d. %s /%s_%s\n", i+1, html.EscapeString(title), code, sessionID))
 	}
 
 	return builder.String()
@@ -244,8 +244,12 @@ func BookPaginator(c tele.Context) error {
 		return nil
 	}
 	items, err := FindBook(c.Message().Payload)
-	if err != nil || len(items) == 0 {
+	if err != nil {
 		return nil
+	}
+	if len(items) == 0 {
+		c.Bot().Send(c.Recipient(), "No results found. Try another query or a different spelling.")
+		return c.Respond()
 	}
 
 	codes, codeMap := buildResultCodes(items, resultListLimit)
