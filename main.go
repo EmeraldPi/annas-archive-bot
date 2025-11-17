@@ -33,6 +33,7 @@ func main() {
 	}
 	b.Use(middleware.Logger())
 
+	b.Handle("/start", StartCommand)
 	b.Handle("/search", BookPaginator)
 	b.Handle("/help", HelpCommand)
 	b.Handle(tele.OnText, HandleShortCodeCommand)

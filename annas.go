@@ -264,11 +264,36 @@ func BookPaginator(c tele.Context) error {
 	return c.Respond()
 }
 
-func HelpCommand(c tele.Context) error {
+func sendHelpText(c tele.Context) error {
 	helpText := "Send /search followed by your keywords (e.g. /search harry potter).\n" +
 		"I’ll return the top results with short /codes. Tap a code to get details and download links.\n" +
 		"Codes stay valid for about 15 minutes per search. Run /search again for fresh results."
 	_, err := c.Bot().Send(c.Recipient(), helpText)
+	return err
+}
+
+func StartCommand(c tele.Context) error {
+	welcome := "Hi! I’m Anna’s Archive bot. I can look up books for you."
+	if _, err := c.Bot().Send(c.Recipient(), welcome); err != nil {
+		return err
+	}
+	return sendHelpText(c)
+}
+
+func HelpCommand(c tele.Context) error {
+	return sendHelpText(c)
+}
+
+func sendFallbackResponse(c tele.Context) error {
+	if c.Message() == nil {
+		return nil
+	}
+	text := strings.TrimSpace(c.Text())
+	if text == "" {
+		return nil
+	}
+	msg := "I don’t understand. Send /help to see how to search for books."
+	_, err := c.Bot().Send(c.Recipient(), msg)
 	return err
 }
 func renderBookDetail(c tele.Context, items []*BookItem, sessionID string, storageItem *BookStorageItem, index int, sender int64, editExisting bool) error {
@@ -346,15 +371,18 @@ func HandleShortCodeCommand(c tele.Context) error {
 	}
 
 	text := strings.TrimSpace(c.Text())
-	if text == "" || !strings.HasPrefix(text, "/") {
+	if text == "" {
 		return nil
+	}
+	if !strings.HasPrefix(text, "/") {
+		return sendFallbackResponse(c)
 	}
 
 	firstWord := strings.Fields(text)[0]
 	if firstWord == "" {
 		return nil
 	}
-	if strings.HasPrefix(firstWord, "/search") || strings.HasPrefix(firstWord, "/help") {
+	if strings.HasPrefix(firstWord, "/search") || strings.HasPrefix(firstWord, "/help") || strings.HasPrefix(firstWord, "/start") {
 		return nil
 	}
 
@@ -364,7 +392,7 @@ func HandleShortCodeCommand(c tele.Context) error {
 	}
 	command = strings.TrimSpace(command)
 	if command == "" {
-		return nil
+		return sendFallbackResponse(c)
 	}
 
 	chat := c.Chat()
@@ -375,23 +403,23 @@ func HandleShortCodeCommand(c tele.Context) error {
 
 	parts := strings.Split(command, "_")
 	if len(parts) != 2 {
-		return nil
+		return sendFallbackResponse(c)
 	}
 	code := strings.ToLower(parts[0])
 	sessionID := parts[1]
 
 	session, ok := getSearchSession(sessionID)
 	if !ok || session == nil {
-		c.Send("Those results expired—please run /books again.")
+		c.Send("Those results expired—please run /search again.")
 		return nil
 	}
 	if session.ChatID != chat.ID || session.SenderID != sender.ID {
-		return nil
+		return sendFallbackResponse(c)
 	}
 
 	index, found := session.CodeMap[code]
 	if !found {
-		return nil
+		return sendFallbackResponse(c)
 	}
 
 	return renderBookDetail(c, session.Items, session.ID, nil, index, sender.ID, false)
