@@ -35,8 +35,7 @@ func main() {
 
 	b.Handle("/books", BookPaginator)
 
-	b.Handle(&bookBtnNext, GetNextPage)
-	b.Handle(&bookBtnPrev, GetPrevPage)
+	b.Handle(&bookBtnSelect, ShowBookDetail)
 	b.Handle(&bookBtnReset, ResetPage)
 	b.Handle(&bookBtnBack, BackPage)
 	b.Handle(&bookBtnDownload, DownloadItem)

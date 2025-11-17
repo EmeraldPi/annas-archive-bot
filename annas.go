@@ -16,9 +16,8 @@ import (
 
 type BookStorageItem struct {
 	message tele.StoredMessage
-	items   interface{}
+	items   []*BookItem
 	page    int
-	maxPage int
 	sender  int64
 	expires time.Time
 }
@@ -35,11 +34,15 @@ type BookItem struct {
 var (
 	selector        = &tele.ReplyMarkup{}
 	bookBtnReset    = selector.Data("🔄", "reset")
-	bookBtnPrev     = selector.Data("⬅", "prev")
-	bookBtnNext     = selector.Data("➡", "next")
+	bookBtnSelect   = selector.Data("Select", "select")
 	bookBtnBack     = selector.Data("Back", "back")
 	bookBtnDownload = selector.Data("Download", "dl", "0")
 	bookStorage     = make(map[int64]map[int]interface{})
+)
+
+const (
+	resultListLimit = 10
+	shortCodeLength = 3
 )
 
 func getReply(item *BookItem) string {
@@ -62,6 +65,72 @@ func getReply(item *BookItem) string {
 	return reply
 }
 
+func generateShortCode(bookURL string, index int, used map[string]bool) string {
+	code := strings.TrimSpace(strings.Trim(bookURL, "/"))
+	if code == "" {
+		code = fmt.Sprintf("book%d", index+1)
+	}
+	parts := strings.Split(code, "/")
+	code = parts[len(parts)-1]
+	code = strings.ReplaceAll(code, "-", "")
+	code = strings.ReplaceAll(code, "_", "")
+	if len(code) > shortCodeLength {
+		code = code[:shortCodeLength]
+	}
+	code = strings.TrimSpace(code)
+	if code == "" {
+		code = fmt.Sprintf("book%d", index+1)
+	}
+
+	base := code
+	counter := 1
+	for used[code] {
+		counter++
+		code = fmt.Sprintf("%s%d", base, counter)
+	}
+	used[code] = true
+	return code
+}
+
+func buildResultList(items []*BookItem, limit int) (string, []tele.Row) {
+	if len(items) == 0 || limit <= 0 {
+		return "", nil
+	}
+	if len(items) < limit {
+		limit = len(items)
+	}
+
+	var builder strings.Builder
+	builder.WriteString("Here are the top results:\n\n")
+
+	rows := make([]tele.Row, 0)
+	currentRow := make([]tele.Btn, 0, 2)
+	usedCodes := make(map[string]bool)
+
+	for i := 0; i < limit; i++ {
+		item := items[i]
+		title := item.Title
+		if title == "" {
+			title = "Untitled"
+		}
+		code := generateShortCode(item.URL, i, usedCodes)
+		builder.WriteString(fmt.Sprintf("%d. %s\n<code>/%s</code>\n\n", i+1, html.EscapeString(title), html.EscapeString(code)))
+
+		btn := selector.Data(fmt.Sprintf("/%s", code), bookBtnSelect.Unique, strconv.Itoa(i))
+		currentRow = append(currentRow, btn)
+		if len(currentRow) == 2 {
+			rows = append(rows, selector.Row(currentRow[0], currentRow[1]))
+			currentRow = currentRow[:0]
+		}
+	}
+
+	if len(currentRow) > 0 {
+		rows = append(rows, selector.Row(currentRow...))
+	}
+
+	return builder.String(), rows
+}
+
 func BookPaginator(c tele.Context) error {
 	if c.Message().Payload == "" {
 		return nil
@@ -71,20 +140,12 @@ func BookPaginator(c tele.Context) error {
 		return nil
 	}
 
-	c.Set("items", items)
-	c.Set("page", 0)
-	c.Set("maxPage", len(items))
+	reply, rows := buildResultList(items, resultListLimit)
+	if reply == "" {
+		return nil
+	}
 
-	bookBtnNext = selector.Data(fmt.Sprintf("➡ %d", 2), "next")
-	bookBtnDownload = selector.Data("Download", "dl", "1")
-	selector.Inline(
-		selector.Row(bookBtnNext),
-		selector.Row(bookBtnDownload),
-	)
-
-	item := items[0]
-	reply := getReply(item)
-
+	selector.Inline(rows...)
 	m, _ := c.Bot().Send(c.Recipient(), reply, selector, tele.ModeHTML)
 
 	_, ok := bookStorage[m.Chat.ID]
@@ -95,8 +156,7 @@ func BookPaginator(c tele.Context) error {
 	bookStorage[m.Chat.ID][m.ID] = &BookStorageItem{
 		message: tele.StoredMessage{ChatID: m.Chat.ID, MessageID: strconv.Itoa(m.ID)},
 		items:   items,
-		page:    1,
-		maxPage: len(items),
+		page:    0,
 		sender:  c.Message().Sender.ID,
 		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
 	}
@@ -123,18 +183,13 @@ func ResetPage(c tele.Context) error {
 		})
 	}
 
-	items := bookItem.items.([]*BookItem)
+	items := bookItem.items
+	reply, rows := buildResultList(items, resultListLimit)
+	if reply == "" {
+		return c.Respond()
+	}
 
-	bookBtnNext = selector.Data(fmt.Sprintf("➡ %d", 2), "next")
-	bookBtnDownload = selector.Data("Download", "dl", "1")
-	selector.Inline(
-		selector.Row(bookBtnNext),
-		selector.Row(bookBtnDownload),
-	)
-
-	item := items[0]
-	reply := getReply(item)
-
+	selector.Inline(rows...)
 	m, err := c.Bot().Edit(bookItem.message, reply, selector, tele.ModeHTML)
 	if err != nil {
 		return c.Respond()
@@ -142,9 +197,66 @@ func ResetPage(c tele.Context) error {
 	bookStorage[m.Chat.ID][m.ID] = &BookStorageItem{
 		message: tele.StoredMessage{ChatID: m.Chat.ID, MessageID: strconv.Itoa(m.ID)},
 		items:   items,
-		page:    1,
-		maxPage: len(items),
+		page:    0,
 		sender:  c.Callback().Sender.ID,
+		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
+	}
+
+	return c.Respond()
+}
+
+func ShowBookDetail(c tele.Context) error {
+	mc := c.Callback().Message
+
+	_, ok := bookStorage[mc.Chat.ID]
+	if !ok {
+		return c.Respond()
+	}
+	bi, ok := bookStorage[mc.Chat.ID][mc.ID]
+	if !ok {
+		return c.Respond()
+	}
+	bookItem := bi.(*BookStorageItem)
+	if bookItem.sender != c.Callback().Sender.ID {
+		fmt.Println("ID don't match: ", bookItem.sender, c.Callback().Sender.ID)
+		return c.Respond(&tele.CallbackResponse{
+			Text: "This is not for you, you silly goober",
+		})
+	}
+
+	idx, err := strconv.Atoi(c.Callback().Data)
+	if err != nil {
+		return c.Respond()
+	}
+
+	return renderBookDetail(c, bookItem, idx, c.Callback().Sender.ID)
+}
+
+func renderBookDetail(c tele.Context, storageItem *BookStorageItem, index int, sender int64) error {
+	items := storageItem.items
+	if len(items) == 0 || index < 0 || index >= len(items) {
+		return c.Respond()
+	}
+
+	bookBtnReset = selector.Data("⬅ Back to results", "reset")
+	bookBtnDownload = selector.Data("Download links", "dl", strconv.Itoa(index+1))
+	selector.Inline(
+		selector.Row(bookBtnReset),
+		selector.Row(bookBtnDownload),
+	)
+
+	item := items[index]
+	reply := getReply(item)
+
+	m, err := c.Bot().Edit(storageItem.message, reply, selector, tele.ModeHTML)
+	if err != nil {
+		return c.Respond()
+	}
+	bookStorage[m.Chat.ID][m.ID] = &BookStorageItem{
+		message: tele.StoredMessage{ChatID: m.Chat.ID, MessageID: strconv.Itoa(m.ID)},
+		items:   items,
+		page:    index + 1,
+		sender:  sender,
 		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
 	}
 
@@ -170,179 +282,12 @@ func BackPage(c tele.Context) error {
 		})
 	}
 
-	items := bookItem.items.([]*BookItem)
-	page := bookItem.page
-	maxPage := bookItem.maxPage
-
-	bookBtnPrev = selector.Data(fmt.Sprintf("⬅ %d", page-1), "prev")
-	bookBtnNext = selector.Data(fmt.Sprintf("➡ %d", page+1), "next")
-	bookBtnDownload = selector.Data("Download", "dl", strconv.Itoa(page))
-	if page > 1 && page < maxPage {
-		selector.Inline(
-			selector.Row(bookBtnReset, bookBtnPrev, bookBtnNext),
-			selector.Row(bookBtnDownload),
-		)
-	} else if page >= maxPage {
-		selector.Inline(
-			selector.Row(bookBtnReset, bookBtnPrev),
-			selector.Row(bookBtnDownload),
-		)
-	} else {
-		selector.Inline(
-			selector.Row(bookBtnNext),
-			selector.Row(bookBtnDownload),
-		)
-	}
-
-	item := items[page-1]
-	reply := getReply(item)
-
-	m, err := c.Bot().Edit(bookItem.message, reply, selector, tele.ModeHTML)
-	if err != nil {
+	index := bookItem.page - 1
+	if index < 0 {
 		return c.Respond()
 	}
-	bookStorage[m.Chat.ID][m.ID] = &BookStorageItem{
-		message: tele.StoredMessage{ChatID: m.Chat.ID, MessageID: strconv.Itoa(m.ID)},
-		items:   items,
-		page:    page,
-		maxPage: len(items),
-		sender:  c.Callback().Sender.ID,
-		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
-	}
 
-	return c.Respond()
-}
-
-func GetNextPage(c tele.Context) error {
-	mc := c.Callback().Message
-
-	_, ok := bookStorage[mc.Chat.ID]
-	if !ok {
-		return c.Respond()
-	}
-	bi, ok := bookStorage[mc.Chat.ID][mc.ID]
-	if !ok {
-		return c.Respond()
-	}
-	bookItem := bi.(*BookStorageItem)
-	if bookItem.sender != c.Callback().Sender.ID {
-		fmt.Println("ID don't match: ", bookItem.sender, c.Callback().Sender.ID)
-		return c.Respond(&tele.CallbackResponse{
-			Text: "This is not for you, you silly goober",
-		})
-	}
-
-	items := bookItem.items.([]*BookItem)
-	page := bookItem.page
-	maxPage := bookItem.maxPage
-
-	page = page + 1
-	if page >= maxPage {
-		page = maxPage
-	}
-	bookBtnPrev = selector.Data(fmt.Sprintf("⬅ %d", page-1), "prev")
-	bookBtnNext = selector.Data(fmt.Sprintf("➡ %d", page+1), "next")
-	bookBtnDownload = selector.Data("Download", "dl", strconv.Itoa(page))
-	if page > 1 && page < maxPage {
-		selector.Inline(
-			selector.Row(bookBtnReset, bookBtnPrev, bookBtnNext),
-			selector.Row(bookBtnDownload),
-		)
-	} else if page >= maxPage {
-		selector.Inline(
-			selector.Row(bookBtnReset, bookBtnPrev),
-			selector.Row(bookBtnDownload),
-		)
-	} else {
-		selector.Inline(
-			selector.Row(bookBtnNext),
-			selector.Row(bookBtnDownload),
-		)
-	}
-
-	item := items[page-1]
-	reply := getReply(item)
-
-	m, err := c.Bot().Edit(bookItem.message, reply, selector, tele.ModeHTML)
-	if err != nil {
-		return c.Respond()
-	}
-	bookStorage[m.Chat.ID][m.ID] = &BookStorageItem{
-		message: tele.StoredMessage{ChatID: m.Chat.ID, MessageID: strconv.Itoa(m.ID)},
-		items:   items,
-		page:    page,
-		maxPage: len(items),
-		sender:  c.Callback().Sender.ID,
-		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
-	}
-
-	return c.Respond()
-}
-
-func GetPrevPage(c tele.Context) error {
-	mc := c.Callback().Message
-
-	_, ok := bookStorage[mc.Chat.ID]
-	if !ok {
-		return c.Respond()
-	}
-	bi, ok := bookStorage[mc.Chat.ID][mc.ID]
-	if !ok {
-		return c.Respond()
-	}
-	bookItem := bi.(*BookStorageItem)
-	if bookItem.sender != c.Callback().Sender.ID {
-		fmt.Println("ID don't match: ", bookItem.sender, c.Callback().Sender.ID)
-		return c.Respond(&tele.CallbackResponse{
-			Text: "This is not for you, you silly goober",
-		})
-	}
-
-	items := bookItem.items.([]*BookItem)
-	page := bookItem.page
-	maxPage := bookItem.maxPage
-
-	page = page - 1
-	if page <= 0 {
-		page = 0
-	}
-	bookBtnPrev = selector.Data(fmt.Sprintf("⬅ %d", page-1), "prev")
-	bookBtnNext = selector.Data(fmt.Sprintf("➡ %d", page+1), "next")
-	bookBtnDownload := selector.Data("Download", "dl", strconv.Itoa(page))
-	if page > 1 && page < maxPage {
-		selector.Inline(
-			selector.Row(bookBtnReset, bookBtnPrev, bookBtnNext),
-			selector.Row(bookBtnDownload),
-		)
-	} else if page >= maxPage {
-		selector.Inline(
-			selector.Row(bookBtnReset, bookBtnPrev),
-			selector.Row(bookBtnDownload),
-		)
-	} else {
-		selector.Inline(
-			selector.Row(bookBtnNext),
-			selector.Row(bookBtnDownload),
-		)
-	}
-
-	item := items[page-1]
-	reply := getReply(item)
-
-	m, err := c.Bot().Edit(bookItem.message, reply, selector, tele.ModeHTML)
-	if err != nil {
-		return c.Respond()
-	}
-	bookStorage[m.Chat.ID][m.ID] = &BookStorageItem{
-		message: tele.StoredMessage{ChatID: m.Chat.ID, MessageID: strconv.Itoa(m.ID)},
-		items:   items,
-		page:    page,
-		maxPage: len(items),
-		sender:  c.Callback().Sender.ID,
-		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
-	}
-
-	return c.Respond()
+	return renderBookDetail(c, bookItem, index, c.Callback().Sender.ID)
 }
 
 func DownloadItem(c tele.Context) error {
@@ -373,7 +318,7 @@ func DownloadItem(c tele.Context) error {
 	}
 
 	page := bookItem.page
-	items := bookItem.items.([]*BookItem)
+	items := bookItem.items
 	item := items[conv-1]
 
 	coll := colly.NewCollector(
@@ -437,7 +382,6 @@ func DownloadItem(c tele.Context) error {
 		message: tele.StoredMessage{ChatID: m.Chat.ID, MessageID: strconv.Itoa(m.ID)},
 		items:   items,
 		page:    page,
-		maxPage: len(items),
 		sender:  c.Callback().Sender.ID,
 		expires: time.Now().Local().Add(time.Hour * time.Duration(1)),
 	}
