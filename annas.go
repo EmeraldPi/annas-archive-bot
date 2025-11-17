@@ -50,17 +50,14 @@ func getReply(item *BookItem) string {
 	if item.Title != "" {
 		reply = reply + fmt.Sprintf("📎 <b>%s</b>\n\n", html.EscapeString(item.Title))
 	}
-	if item.Meta != "" {
-		reply = reply + fmt.Sprintf("• %s\n", html.EscapeString(item.Meta))
-	}
-	if item.Title != "" {
-		reply = reply + fmt.Sprintf("• %s\n", html.EscapeString(item.Title))
+	if item.Authors != "" {
+		reply = reply + fmt.Sprintf("• %s\n", html.EscapeString(item.Authors))
 	}
 	if item.Publisher != "" {
 		reply = reply + fmt.Sprintf("• %s\n", html.EscapeString(item.Publisher))
 	}
-	if item.Authors != "" {
-		reply = reply + fmt.Sprintf("• %s\n\n", html.EscapeString(item.Authors))
+	if item.Meta != "" {
+		reply = reply + fmt.Sprintf("• %s\n", html.EscapeString(item.Meta))
 	}
 	return reply
 }
@@ -453,24 +450,10 @@ func FindBook(query string) ([]*BookItem, error) {
 		colly.Async(true),
 	)
 
-	bookList := make([]*string, 0)
+	var pageHTML string
 
-	c.OnHTML("div", func(e *colly.HTMLElement) {
-		if strings.Contains(e.Attr("class"), "h-[125]") {
-			v, err := e.DOM.Html()
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-			v = strings.TrimSpace(v)
-			if strings.HasPrefix(v, "<!-") {
-				v = strings.Trim(v, "<!-")
-				v = strings.Trim(v, "->")
-				v = html.UnescapeString(v)
-			}
-
-			bookList = append(bookList, &v)
-		}
+	c.OnResponse(func(r *colly.Response) {
+		pageHTML = string(r.Body)
 	})
 
 	c.OnRequest(func(r *colly.Request) {
@@ -478,51 +461,105 @@ func FindBook(query string) ([]*BookItem, error) {
 	})
 
 	fullURL := "https://annas-archive.org/search?q=" + url.QueryEscape(query)
-	c.Visit(fullURL)
+	err := c.Visit(fullURL)
+	if err != nil {
+		return nil, err
+	}
 	c.Wait()
 
 	bookListParsed := make([]*BookItem, 0)
 
-	for i := 0; i < len(bookList); i++ {
-		var doc, _ = goquery.NewDocumentFromReader(strings.NewReader(*bookList[i]))
-		doc.Find("a").Each(func(i int, s *goquery.Selection) {
-			v := strings.Split(strings.TrimSpace(s.Text()), "\n")
-
-			img := s.Find("img").AttrOr("src", "")
-			if len(v) == 4 {
-				bookListParsed = append(bookListParsed, &BookItem{
-					Meta:      strings.TrimSpace(v[0]),
-					Title:     strings.TrimSpace(v[1]),
-					Publisher: strings.TrimSpace(v[2]),
-					Authors:   strings.TrimSpace(v[3]),
-					URL:       s.AttrOr("href", ""),
-					Image:     img,
-				})
-			} else if len(v) == 3 {
-				bookListParsed = append(bookListParsed, &BookItem{
-					Meta:      strings.TrimSpace(v[0]),
-					Title:     strings.TrimSpace(v[1]),
-					Publisher: strings.TrimSpace(v[2]),
-					URL:       s.AttrOr("href", ""),
-					Image:     img,
-				})
-			} else if len(v) == 2 {
-				bookListParsed = append(bookListParsed, &BookItem{
-					Meta:  strings.TrimSpace(v[0]),
-					Title: strings.TrimSpace(v[1]),
-					URL:   s.AttrOr("href", ""),
-					Image: img,
-				})
-			} else {
-				bookListParsed = append(bookListParsed, &BookItem{
-					Meta:  strings.TrimSpace(v[0]),
-					URL:   s.AttrOr("href", ""),
-					Image: img,
-				})
-			}
-
-		})
+	if pageHTML == "" {
+		return bookListParsed, nil
 	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(pageHTML))
+	if err != nil {
+		return nil, err
+	}
+
+	normalizeText := func(s string) string {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return ""
+		}
+		return strings.Join(strings.Fields(s), " ")
+	}
+
+	cleanSelectionText := func(sel *goquery.Selection) string {
+		if sel.Length() == 0 {
+			return ""
+		}
+		clone := sel.Clone()
+		clone.Find("span").Remove()
+		clone.Find("script").Remove()
+		return normalizeText(clone.Text())
+	}
+
+	extractMeta := func(sel *goquery.Selection) string {
+		if sel.Length() == 0 {
+			return ""
+		}
+		clone := sel.Clone()
+		clone.Find("a").Remove()
+		clone.Find("script").Remove()
+		return normalizeText(clone.Text())
+	}
+
+	hasIconClass := func(sel *goquery.Selection, class string) bool {
+		if strings.Contains(sel.AttrOr("class", ""), class) {
+			return true
+		}
+
+		found := false
+		sel.Find("span").Each(func(_ int, span *goquery.Selection) {
+			if found {
+				return
+			}
+			if strings.Contains(span.AttrOr("class", ""), class) {
+				found = true
+			}
+		})
+		return found
+	}
+
+	doc.Find(".js-aarecord-list-outer > div.flex").Each(func(i int, s *goquery.Selection) {
+		details := s.Find("div.max-w-full").First()
+		if details.Length() == 0 {
+			return
+		}
+
+		titleSel := details.Find("a.js-vim-focus").First()
+		title := cleanSelectionText(titleSel)
+		if title == "" {
+			return
+		}
+
+		bookURL := titleSel.AttrOr("href", "")
+		img := s.Find("img").First().AttrOr("src", "")
+
+		meta := extractMeta(s.Find("div.text-gray-800").First())
+
+		authors := ""
+		publisher := ""
+		details.Find("a").Each(func(_ int, link *goquery.Selection) {
+			switch {
+			case authors == "" && hasIconClass(link, "icon-[mdi--user-edit]"):
+				authors = cleanSelectionText(link)
+			case publisher == "" && hasIconClass(link, "icon-[mdi--company]"):
+				publisher = cleanSelectionText(link)
+			}
+		})
+
+		bookListParsed = append(bookListParsed, &BookItem{
+			Meta:      meta,
+			Title:     title,
+			Publisher: publisher,
+			Authors:   authors,
+			URL:       bookURL,
+			Image:     img,
+		})
+	})
 
 	return bookListParsed, nil
 
