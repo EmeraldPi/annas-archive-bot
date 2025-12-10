@@ -296,7 +296,7 @@ func sendFallbackResponse(c tele.Context) error {
 	if text == "" {
 		return nil
 	}
-	msg := "I don’t understand. Send /help to see how to search for books."
+	msg := "I don't understand. Send /help to see how to search for books."
 	_, err := c.Bot().Send(c.Recipient(), msg)
 	return err
 }
@@ -463,12 +463,25 @@ func DownloadItem(c tele.Context) error {
 		colly.Async(true),
 	)
 
-	urls := make([]string, 0)
-	coll.OnHTML("a", func(e *colly.HTMLElement) {
-		if strings.Contains(e.Attr("class"), "js-download-link") {
-			if e.Attr("href") != "" {
-				urls = append(urls, e.Attr("href"))
-			}
+	waitlistLinks := make([]string, 0, 2)
+	noWaitlistLinks := make([]string, 0, 2)
+
+	coll.OnHTML("li.list-disc", func(e *colly.HTMLElement) {
+		anchor := e.DOM.Find("a.js-download-link").First()
+		if anchor.Length() == 0 {
+			return
+		}
+		href, exists := anchor.Attr("href")
+		if !exists || !strings.HasPrefix(href, "/slow_download/") {
+			return
+		}
+
+		text := strings.TrimSpace(e.DOM.Text())
+		switch {
+		case strings.Contains(text, "(slightly faster but with waitlist)") && len(waitlistLinks) < 2:
+			waitlistLinks = append(waitlistLinks, href)
+		case strings.Contains(text, "(no waitlist, but can be very slow)") && len(noWaitlistLinks) < 2:
+			noWaitlistLinks = append(noWaitlistLinks, href)
 		}
 	})
 
@@ -483,6 +496,7 @@ func DownloadItem(c tele.Context) error {
 	rows := make([]tele.Row, 0)
 	rows = append(rows, selector.Row(bookBtnBack))
 	mirrorCount := 1
+	urls := append(append([]string{}, waitlistLinks...), noWaitlistLinks...)
 	fmt.Println("URLS list: ", urls)
 	for _, u := range urls {
 		// skip URLs that require authentication

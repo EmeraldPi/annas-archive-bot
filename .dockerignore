@@ -1,8 +1,28 @@
-Dockerfile
 .git
 .gitignore
-.gocache
-*.log
-preview.png
-sample.html
+
+# Editor/IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Go build artifacts
+bin/
+obj/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
 __debug*
+
+# Logs and caches
+*.log
+.gocache
+
